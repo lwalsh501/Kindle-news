@@ -137,48 +137,7 @@ formatted_interests = "\n".join([f"- {topic}" for topic in USER_INTEREST_TOPICS]
 PROMPT_PERSONALIZED_CURATION = f"""You are an executive editor scoring daily news articles for a user with specific interest domains.
 
 Evaluate candidate articles by assigning a score from 1 to 100 and eliminating duplicate coverage.
-
-PRIMARY USER INTEREST TOPICS:
-{formatted_interests}
-
-EVALUATION & SCORING RULES:
-1. Interest Alignment: Articles directly matching one or more of the PRIMARY USER INTEREST TOPICS must receive high scores (70–100).
-2. Off-Topic Filtering: Articles completely unrelated to any listed interest topic (e.g. international corporate news, unrelated sports like European soccer, foreign regional news) must receive low scores (below 30).
-3. Semantic Deduplication: If multiple articles cover the exact same story, retain ONLY the single most detailed, comprehensive piece and assign lower/zero scores to the duplicates.
-4. Depth Preference: Reward long-form reporting, interviews, and analytical pieces over short wire summaries or live-blog posts.
-
-Return your evaluation as a raw JSON array of dictionaries containing 'index' and 'score'. Do not include markdown formatting or extra text.
-
-Example output format:
-[
-  {{"index": 0, "score": 95}},
-  {{"index": 2, "score": 82}}
-]"""
-
-def gemini_score_articles(articles):
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key or genai is None or not articles:
-        return articles
-
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
-
-        article_summaries = []
-        for idx, art in enumerate(articles):
-            article_summaries.append(f"[{idx}] Title: {art['title']}\nDescription: {art.get('description', '')}\n")
-
-        full_prompt = f"{PROMPT_PERSONALIZED_CURATION}\n\nCandidate Articles:\n" + "\n".join(article_summaries)
-        response = model.generate_content(full_prompt)
-        text_resp = response.text.strip()
-        
-        if text_resp.startswith("```json"):
-            text_resp = text_resp[7:]
-        if text_resp.endswith("```"):
-            text_resp = text_resp[:-3]
-        text_resp = text_resp.strip()
-
-        scores_data = json.loads(text_resp)
+scores_data = json.loads(text_resp)
         score_map = {item["index"]: item["score"] for item in scores_data}
 
         for idx, art in enumerate(articles):
@@ -187,7 +146,29 @@ def gemini_score_articles(articles):
         articles.sort(key=lambda x: x.get("score", 0), reverse=True)
     except Exception as e:
         print(f"⚠️ Gemini scoring error, falling back to keyword logic: {e}", file=sys.stderr)
-negative_keywords = [r'\bsoccer\b', r'\bcricket\b', r'\bcelebrity gossip\b']
+
+    return articles
+
+# ==========================================
+# 3. BACKUP KEYWORD SCORING (FAILSAFE)
+# ==========================================
+
+def calculate_fallback_score(title, description):
+    text = f"{title} {description}".lower()
+    score = 50
+    
+    keywords = [
+        r'\bafl\b', r'\bessendon\b', r'\bvictoria\b', r'\bvictorian\b', 
+        r'\balbury\b', r'\bradio\b', r'\bcommunity radio\b', r'\bnintendo\b', 
+        r'\bretrotech\b', r'\bretro gaming\b', r'\baustralian politics\b',
+        r'\bcomedy\b', r'\bmedia\b', r'\bus politics\b'
+    ]
+    
+    for kw in keywords:
+        if re.search(kw, text):
+            score += 15
+
+    negative_keywords = [r'\bsoccer\b', r'\bcricket\b', r'\bcelebrity gossip\b']
     for nkw in negative_keywords:
         if re.search(nkw, text):
             score -= 20
