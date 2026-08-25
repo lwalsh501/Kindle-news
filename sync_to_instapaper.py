@@ -5,6 +5,7 @@ import argparse
 import ssl
 import urllib.request
 import urllib.parse
+from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 import warnings
 import datetime
@@ -102,21 +103,6 @@ def fetch_rss_items(url):
         print(f"Error fetching feed {url}: {e}", file=sys.stderr)
     return items
 
-def fetch_full_content(url):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        context = ssl._create_unverified_context()
-        with urllib.request.urlopen(req, context=context, timeout=10) as resp:
-            html_content = resp.read().decode('utf-8', errors='ignore')
-            paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html_content, re.DOTALL)
-            clean_paragraphs = [re.sub(r'<[^<]+?>', '', p).strip() for p in paragraphs if len(re.sub(r'<[^<]+?>', '', p).strip()) > 30]
-            if clean_paragraphs:
-                return "\n\n".join(clean_paragraphs)
-    except Exception as e:
-        print(f"Error fetching content for {url}: {e}", file=sys.stderr)
-    return None
-
 # ==========================================
 # 2. GEMINI SCORING & INTEREST PROMPTS
 # ==========================================
@@ -126,7 +112,6 @@ USER_INTEREST_TOPICS = [
     "Australian Federal Politics, Victorian State Politics, and public policy in Victoria",
     "Australian Media, Commercial Radio, Community Radio, and broadcasting regulation",
     "American Politics, US elections, and geopolitical news",
-    "Melbourne Gigs and Music"
     "Australian Comedy, satire, and local entertainment culture",
     "Retrotech, retro gaming, Nintendo, and historical computing technology",
     "Local regional Victorian news (including Albury-Wodonga and border communities)"
@@ -137,7 +122,48 @@ formatted_interests = "\n".join([f"- {topic}" for topic in USER_INTEREST_TOPICS]
 PROMPT_PERSONALIZED_CURATION = f"""You are an executive editor scoring daily news articles for a user with specific interest domains.
 
 Evaluate candidate articles by assigning a score from 1 to 100 and eliminating duplicate coverage.
-scores_data = json.loads(text_resp)
+
+PRIMARY USER INTEREST TOPICS:
+{formatted_interests}
+
+EVALUATION & SCORING RULES:
+1. Interest Alignment: Articles directly matching one or more of the PRIMARY USER INTEREST TOPICS must receive high scores (70–100).
+2. Off-Topic Filtering: Articles completely unrelated to any listed interest topic (e.g. international corporate news, unrelated sports like European soccer, foreign regional news) must receive low scores (below 30).
+3. Semantic Deduplication: If multiple articles cover the exact same story, retain ONLY the single most detailed, comprehensive piece and assign lower/zero scores to the duplicates.
+4. Depth Preference: Reward long-form reporting, interviews, and analytical pieces over short wire summaries or live-blog posts.
+
+Return your evaluation as a raw JSON array of dictionaries containing 'index' and 'score'. Do not include markdown formatting or extra text.
+
+Example output format:
+[
+  {{"index": 0, "score": 95}},
+  {{"index": 2, "score": 82}}
+]"""
+
+def gemini_score_articles(articles):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key or genai is None or not articles:
+        return articles
+
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash')
+
+        article_summaries = []
+        for idx, art in enumerate(articles):
+            article_summaries.append(f"[{idx}] Title: {art['title']}\nDescription: {art.get('description', '')}\n")
+
+        full_prompt = f"{PROMPT_PERSONALIZED_CURATION}\n\nCandidate Articles:\n" + "\n".join(article_summaries)
+        response = model.generate_content(full_prompt)
+        text_resp = response.text.strip()
+        
+        if text_resp.startswith("```json"):
+            text_resp = text_resp[7:]
+        if text_resp.endswith("```"):
+            text_resp = text_resp[:-3]
+        text_resp = text_resp.strip()
+
+        scores_data = json.loads(text_resp)
         score_map = {item["index"]: item["score"] for item in scores_data}
 
         for idx, art in enumerate(articles):
@@ -180,35 +206,11 @@ def calculate_fallback_score(title, description):
 # ==========================================
 
 def apply_diversity_cap(articles, max_per_domain=2):
-    ...
-    
-# ==========================================
-# 5. MAIN EXECUTION PIPELINE
-# ==========================================
-
-def main():
-    parser = argparse.ArgumentParser(description="Sync curated news feeds to Instapaper.")
-    parser.add_argument("--dry-run", action="store_true", help="Run scoring without sending to Instapaper")
-    parser.add_argument("--auto", action="store_true", help="Run in automated mode via GitHub Actions")
-    args, unknown = parser.parse_known_args()
-
-    negative_keywords = [r'\bsoccer\b', r'\bcricket\b', r'\bcelebrity gossip\b']
-    for nkw in negative_keywords:
-        if re.search(nkw, text):
-            score -= 20
-
-    return max(0, min(100, score))
-
-# ==========================================
-# 4. DIVERSITY CAP & INSTAPAPER SYNC
-# ==========================================
-
-def apply_diversity_cap(articles, max_per_domain=2):
     domain_counts = {}
     capped_list = []
     
     for art in articles:
-        domain = urllib.parse.urlparse(art['link']).netloc
+        domain = urlparse(art['link']).netloc
         count = domain_counts.get(domain, 0)
         if count < max_per_domain:
             capped_list.append(art)
@@ -246,7 +248,8 @@ def post_to_instapaper(url, title="", summary=""):
 def main():
     parser = argparse.ArgumentParser(description="Sync curated news feeds to Instapaper.")
     parser.add_argument("--dry-run", action="store_true", help="Run scoring without sending to Instapaper")
-    args = parser.parse_args()
+    parser.add_argument("--auto", action="store_true", help="Run in automated mode via GitHub Actions")
+    args, unknown = parser.parse_known_args()
 
     print("🚀 Fetching Australian news & personal interest feeds...")
     all_raw_articles = []
@@ -280,7 +283,7 @@ def main():
     for idx, art in enumerate(final_selection, 1):
         print(f"{idx}. [{art.get('score', 0)} pts] {art['title']} ({art['link']})")
 
-    if args.dry-run:
+    if args.dry_run:
         print("\n🧪 Dry run complete. No articles sent to Instapaper.")
         return
 
