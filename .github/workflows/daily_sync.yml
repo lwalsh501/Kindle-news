@@ -1,11 +1,11 @@
 name: Daily Instapaper News Sync
 
 on:
+  push:              # Forces GitHub to index the workflow and run on save
+  workflow_dispatch: # Enables the manual "Run workflow" button
   schedule:
-    # Runs at 10:30 UTC (6:30 AM EDT / 7:30 AM EST).
-    # Adjust this cron expression if your timezone offset changes.
-    - cron: '30 10 * * *'
-  workflow_dispatch: # Allows you to run it manually from the GitHub Actions tab
+    # Runs at 20:30 UTC = 6:30 AM AEST (Melbourne/Sydney winter)
+    - cron: '30 20 * * *'
 
 jobs:
   sync:
@@ -69,4 +69,3 @@ jobs:
             git commit -m "Auto-update web dashboard [skip ci]"
             git push
           fi
-
