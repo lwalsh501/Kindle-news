@@ -187,27 +187,29 @@ def gemini_score_articles(articles):
         articles.sort(key=lambda x: x.get("score", 0), reverse=True)
     except Exception as e:
         print(f"⚠️ Gemini scoring error, falling back to keyword logic: {e}", file=sys.stderr)
+negative_keywords = [r'\bsoccer\b', r'\bcricket\b', r'\bcelebrity gossip\b']
+    for nkw in negative_keywords:
+        if re.search(nkw, text):
+            score -= 20
 
-    return articles
+    return max(0, min(100, score))
 
 # ==========================================
-# 3. BACKUP KEYWORD SCORING (FAILSAFE)
+# 4. DIVERSITY CAP & INSTAPAPER SYNC
 # ==========================================
 
-def calculate_fallback_score(title, description):
-    text = f"{title} {description}".lower()
-    score = 50
+def apply_diversity_cap(articles, max_per_domain=2):
+    ...
     
-    keywords = [
-        r'\bafl\b', r'\bessendon\b', r'\bvictoria\b', r'\bvictorian\b', 
-        r'\balbury\b', r'\bradio\b', r'\bcommunity radio\b', r'\bnintendo\b', 
-        r'\bretrotech\b', r'\bretro gaming\b', r'\baustralian politics\b',
-        r'\bcomedy\b', r'\bmedia\b', r'\bus politics\b'
-    ]
-    
-    for kw in keywords:
-        if re.search(kw, text):
-            score += 15
+# ==========================================
+# 5. MAIN EXECUTION PIPELINE
+# ==========================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync curated news feeds to Instapaper.")
+    parser.add_argument("--dry-run", action="store_true", help="Run scoring without sending to Instapaper")
+    parser.add_argument("--auto", action="store_true", help="Run in automated mode via GitHub Actions")
+    args, unknown = parser.parse_known_args()
 
     negative_keywords = [r'\bsoccer\b', r'\bcricket\b', r'\bcelebrity gossip\b']
     for nkw in negative_keywords:
