@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import sys
 import json
@@ -10,19 +9,53 @@ import xml.etree.ElementTree as ET
 import warnings
 import datetime
 import email.utils
+import re
 from dotenv import load_dotenv
 
-# Suppress all python warnings (e.g. LibreSSL deprecations, Google SDK deprecations)
-warnings.filterwarnings("ignore")
+# Optional external imports
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
-# Load environment variables from .env file
+try:
+    from requests_oauthlib import OAuth1Session
+except ImportError:
+    OAuth1Session = None
+
+warnings.filterwarnings("ignore")
 load_dotenv(override=True)
 
-# Instapaper API Endpoint
 INSTAPAPER_ADD_URL = "https://www.instapaper.com/api/add"
 
+# ==========================================
+# 1. EXTENDED AUSTRALIAN RSS FEEDS
+# ==========================================
+
+FEEDS_POLITICAL_RISK = [
+    "https://www.abc.net.au/news/feed/51120/rss.xml",
+    "https://www.sbs.com.au/news/feed",
+    "https://www.theage.com.au/rss/politics/federal.xml",
+    "https://www.theage.com.au/rss/national/victoria.xml",
+    "https://www.crikey.com.au/feed"
+]
+
+FEEDS_AI_POLICY = [
+    "https://www.theage.com.au/rss/technology.xml",
+    "https://ausretrogamer.com/feed/",
+    "https://press-start.com.au/feed",
+    "https://news.google.com/rss/search?q=Nintendo+OR+%22retrotech%22+OR+%22retro+gaming%22&hl=en-AU&gl=AU&ceid=AU:en"
+]
+
+FEEDS_AI_INDUSTRY = [
+    "https://www.theage.com.au/rss/sport/afl.xml",
+    "https://www.foxsports.com.au/content-hosts/afl/rss",
+    "https://www.theage.com.au/rss/culture.xml",
+    "https://checkpointgaming.net/news/feed",
+    "https://news.google.com/rss/search?q=%22Australian+radio%22+OR+%22community+radio%22+OR+%22Essendon%22+OR+%22Albury%22&hl=en-AU&gl=AU&ceid=AU:en"
+]
+
 def is_within_24_hours(pub_date_str):
-    """Check if an RFC 822 pubDate string is within the last 24 hours."""
     if not pub_date_str:
         return True
     try:
@@ -35,16 +68,15 @@ def is_within_24_hours(pub_date_str):
         return True
 
 def fetch_rss_items(url):
-    """Fetch and parse RSS and Atom items from a feed URL."""
     context = ssl._create_unverified_context()
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'}
+    req = urllib.request.Request(url, headers=headers)
     items = []
     try:
-        with urllib.request.urlopen(req, context=context) as response:
+        with urllib.request.urlopen(req, context=context, timeout=10) as response:
             xml_data = response.read()
             root = ET.fromstring(xml_data)
             
-            # 1. Standard RSS items
             for item in root.findall('.//item'):
                 title = item.find('title')
                 link = item.find('link')
@@ -57,36 +89,8 @@ def fetch_rss_items(url):
                 pub_date_text = pub_date.text if pub_date is not None and pub_date.text else ""
                 
                 if desc_text:
-                    import re
                     desc_text = re.sub('<[^<]+?>', '', desc_text).strip()
 
-                if is_within_24_hours(pub_date_text):
-                    items.append({
-                        'title': title_text.strip(),
-                        'link': link_text.strip(),
-                        'description': desc_text,
-                        'pub_date': pub_date_text
-                    })
-                    
-            # 2. Atom entries (e.g. The Verge, Ars Technica)
-            ns = {'atom': 'http://www.w3.org/2005/Atom'}
-            for entry in root.findall('.//atom:entry', ns) + root.findall('.//entry'):
-                title = entry.find('atom:title', ns) if entry.find('atom:title', ns) is not None else entry.find('title')
-                link = entry.find('atom:link', ns) if entry.find('atom:link', ns) is not None else entry.find('link')
-                summary = entry.find('atom:summary', ns) or entry.find('atom:content', ns) or entry.find('summary') or entry.find('content')
-                pub_date = entry.find('atom:published', ns) or entry.find('atom:updated', ns) or entry.find('published') or entry.find('updated')
-                
-                title_text = title.text if title is not None and title.text else ""
-                link_text = ""
-                if link is not None:
-                    link_text = link.get('href') or link.text or ""
-                desc_text = summary.text if summary is not None and summary.text else ""
-                pub_date_text = pub_date.text if pub_date is not None and pub_date.text else ""
-                
-                if desc_text:
-                    import re
-                    desc_text = re.sub('<[^<]+?>', '', desc_text).strip()
-                    
                 if is_within_24_hours(pub_date_text):
                     items.append({
                         'title': title_text.strip(),
@@ -98,910 +102,212 @@ def fetch_rss_items(url):
         print(f"Error fetching feed {url}: {e}", file=sys.stderr)
     return items
 
-def resolve_google_news_url(url):
-    """Resolve Google News redirect/tracking URLs using googlenewsdecoder."""
-    if "news.google.com" in url:
-        try:
-            from googlenewsdecoder import gnewsdecoder
-            decoded = gnewsdecoder(url, interval=0.1)
-            if decoded.get("status"):
-                return decoded["decoded_url"]
-        except Exception as e:
-            print(f"Warning: Failed to decode Google News URL using library ({e}). Using raw URL.", file=sys.stderr)
-    return url
-
-def get_unlocked_archive_url(url):
-    """
-    Checks if a URL is from a known paywalled publisher or if an archive snapshot exists.
-    Returns the Wayback Machine / Archive URL if available, otherwise returns the original URL.
-    """
-    paywalled_domains = [
-        "ft.com", "wsj.com", "bloomberg.com", "economist.com", 
-        "foreignaffairs.com", "thetimes.co.uk", "nytimes.com", "telegraph.co.uk", "lemonde.fr"
-    ]
-    
-    domain = urllib.parse.urlparse(url).netloc.lower()
-    is_paywalled = any(p in domain for p in paywalled_domains)
-    
-    if is_paywalled:
-        try:
-            api_url = f"https://archive.org/wayback/available?url={urllib.parse.quote(url)}"
-            req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
-            context = ssl._create_unverified_context()
-            with urllib.request.urlopen(req, context=context, timeout=4) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
-                snapshots = data.get('archived_snapshots', {})
-                closest = snapshots.get('closest', {})
-                if closest.get('available') and closest.get('url'):
-                    archive_url = closest['url']
-                    print(f"  [Archive Unlocked] Found Wayback mirror for {domain}: {archive_url}")
-                    return archive_url
-        except Exception as e:
-            print(f"  [Archive Check] Could not fetch archive for {url}: {e}", file=sys.stderr)
-            
-    return url
-
-def fetch_lemonde_full_content(url):
-    """
-    Extracts the full subscriber HTML content from a Le Monde article URL
-    using the mobile API endpoint with image template placeholders fixed.
-    """
-    import re
-    match = re.search(r'_(\d+)_\d+\.html', url)
-    if not match:
-        match = re.search(r'_(\d+)(?:\.html)?$', url)
-    if not match:
-        return None
-        
-    article_id = match.group(1)
-    api_url = f"https://apps.lemonde.fr/aec/v1/premium-android-phone/article/{article_id}"
-    headers = {
-        'User-Agent': 'LeMonde/9.20.1 (Android; 14)',
-        'X-Lmd-Token': 'TWPLMOLMO',
-        'Accept': 'application/json'
-    }
-    
+def fetch_full_content(url):
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
-        import requests
-        resp = requests.get(api_url, headers=headers, timeout=8)
-        if resp.status_code == 200:
-            data = resp.json()
-            content = data.get('template_vars', {}).get('content', '')
-            title = data.get('template_vars', {}).get('seo_title') or data.get('template_vars', {}).get('title', '')
-            if content:
-                # Fix image template placeholders
-                content = content.replace('%7B%7Bwidth%7D%7D', '1000').replace('{{width}}', '1000')
-                content = content.replace('%7B%7Bheight%7D%7D', '600').replace('{{height}}', '600')
-                
-                full_html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-</head>
-<body>
-{content}
-</body>
-</html>"""
-                return {
-                    'title': title,
-                    'html': full_html
-                }
-    except Exception as e:
-        print(f"  [Le Monde Extractor] Error extracting article {article_id}: {e}", file=sys.stderr)
-        
-    return None
-
-def fetch_ft_full_content(url):
-    """
-    Extracts the full subscriber HTML content from a Financial Times article URL
-    using the FT_COOKIE / FTSession_s if available.
-    """
-    cookie = os.environ.get("FT_COOKIE")
-    if not cookie:
-        return None
-        
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cookie': cookie if 'FTSession' in cookie else f"FTSession_s={cookie}; FTSession={cookie}"
-    }
-    
-    try:
-        import requests
-        from bs4 import BeautifulSoup
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            body = soup.find('div', {'id': 'article-body'}) or soup.find('article')
-            title_tag = soup.find('h1') or soup.find('meta', property='og:title')
-            title = title_tag.get_text(strip=True) if title_tag else "Financial Times"
-            if body and len(body.get_text(strip=True)) > 400:
-                full_html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-</head>
-<body>
-<h1>{title}</h1>
-{str(body)}
-</body>
-</html>"""
-                return {
-                    'title': title,
-                    'html': full_html
-                }
-    except Exception as e:
-        print(f"  [FT Extractor] Error extracting article: {e}", file=sys.stderr)
-        
-    return None
-
-def fetch_economist_full_content(url):
-    """
-    Extracts the full subscriber HTML content from an Economist article URL
-    using ECONOMIST_COOKIE and curl_cffi with Chrome impersonation.
-    """
-    cookie = os.environ.get("ECONOMIST_COOKIE")
-    headers = {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-    }
-    if cookie:
-        headers['Cookie'] = cookie
-        
-    try:
-        try:
-            from curl_cffi import requests as cffi_requests
-            resp = cffi_requests.get(url, headers=headers, impersonate="chrome124", timeout=15)
-        except Exception:
-            import requests
-            headers['User-Agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-            resp = requests.get(url, headers=headers, timeout=12)
-            
-        if resp.status_code == 200:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            
-            # 1. Try __NEXT_DATA__ JSON payload
-            next_data = soup.find('script', {'id': '__NEXT_DATA__'})
-            if next_data:
-                try:
-                    import json
-                    data = json.loads(next_data.string)
-                    content = data.get('props', {}).get('pageProps', {}).get('content', {})
-                    headline = content.get('headline') or data.get('props', {}).get('pageProps', {}).get('headline', '')
-                    body_parts = content.get('body', [])
-                    if body_parts and len(body_parts) > 2:
-                        html_pieces = []
-                        for part in body_parts:
-                            if isinstance(part, dict) and part.get('textHtml'):
-                                html_pieces.append(f"<p>{part.get('textHtml')}</p>")
-                            elif isinstance(part, dict) and part.get('text'):
-                                html_pieces.append(f"<p>{part.get('text')}</p>")
-                        if html_pieces:
-                            full_html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{headline}</title></head><body><h1>{headline}</h1>{''.join(html_pieces)}</body></html>"""
-                            return {'title': headline or "The Economist", 'html': full_html}
-                except Exception:
-                    pass
-
-            # 2. Try HTML article body
-            body = soup.find('article') or soup.find('div', {'class': lambda c: c and 'article__body' in c})
-            title_tag = soup.find('h1')
-            title = title_tag.get_text(strip=True) if title_tag else "The Economist"
-            if body and len(body.get_text(strip=True)) > 500:
-                full_html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{title}</title></head><body><h1>{title}</h1>{str(body)}</body></html>"""
-                return {'title': title, 'html': full_html}
-    except Exception as e:
-        print(f"  [Economist Extractor] Error extracting article: {e}", file=sys.stderr)
-        
-    return None
-
-def fetch_article_context(url, fallback_desc=""):
-    """Fetch full text using trafilatura or direct extractors, return a 1500-char snippet."""
-    if "lemonde.fr" in url:
-        lm_data = fetch_lemonde_full_content(url)
-        if lm_data and lm_data.get('html'):
-            try:
-                import trafilatura
-                extracted = trafilatura.extract(lm_data['html'])
-                if extracted:
-                    return extracted[:1500]
-            except Exception:
-                pass
-    elif "economist.com" in url:
-        ec_data = fetch_economist_full_content(url)
-        if ec_data and ec_data.get('html'):
-            try:
-                import trafilatura
-                extracted = trafilatura.extract(ec_data['html'])
-                if extracted:
-                    return extracted[:1500]
-            except Exception:
-                pass
-            except Exception:
-                pass
-
-    if "ft.com" in url:
-        ft_data = fetch_ft_full_content(url)
-        if ft_data and ft_data.get('html'):
-            try:
-                import trafilatura
-                extracted = trafilatura.extract(ft_data['html'])
-                if extracted:
-                    return extracted[:1500]
-            except Exception:
-                pass
-
-    try:
-        import urllib.request
-        import ssl
-        import trafilatura
-        
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        req = urllib.request.Request(url, headers=headers)
         context = ssl._create_unverified_context()
-        with urllib.request.urlopen(req, context=context, timeout=5) as response:
-            html = response.read()
-            
-        text = trafilatura.extract(html)
-        if text:
-            return text[:1500]
+        with urllib.request.urlopen(req, context=context, timeout=10) as resp:
+            html_content = resp.read().decode('utf-8', errors='ignore')
+            paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html_content, re.DOTALL)
+            clean_paragraphs = [re.sub(r'<[^<]+?>', '', p).strip() for p in paragraphs if len(re.sub(r'<[^<]+?>', '', p).strip()) > 30]
+            if clean_paragraphs:
+                return "\n\n".join(clean_paragraphs)
     except Exception as e:
-        print(f"Warning: Failed to extract full text for {url}: {e}", file=sys.stderr)
-    return fallback_desc
+        print(f"Error fetching content for {url}: {e}", file=sys.stderr)
+    return None
 
-def gemini_score_articles(articles, topic, api_key):
-    """Use Gemini API to semantically deduplicate and score articles with deep context."""
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        
-        articles_list = []
-        for i, art in enumerate(articles):
-            source = extract_source_domain(art)
-            resolved_url = resolve_google_news_url(art['link'])
-            context = fetch_article_context(resolved_url, fallback_desc=art.get('description', ''))
-            articles_list.append(f"[{i}] Publisher: {source} | Title: {art['title']}\nSnippet: {context}\n")
-            
-        articles_text = "\n".join(articles_list)
-        
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        
-        if topic == "political_risk":
-            prompt = """You are a strict, professional executive editor curating a daily political risk 
-briefing for an MSc student targeting political risk consulting (Control Risks, 
-Eurasia Group, Oxford Analytica).
+# ==========================================
+# 2. GEMINI SCORING & INTEREST PROMPTS
+# ==========================================
 
-Here is a list of candidate articles with text snippets. Score them for topical 
-relevance AND quality, then eliminate duplicates.
+USER_INTEREST_TOPICS = [
+    "AFL (Australian Football League), Essendon Football Club, and Victorian sports news",
+    "Australian Federal Politics, Victorian State Politics, and public policy in Victoria",
+    "Australian Media, Commercial Radio, Community Radio, and broadcasting regulation",
+    "American Politics, US elections, and geopolitical news",
+    "Melbourne Gigs and Music"
+    "Australian Comedy, satire, and local entertainment culture",
+    "Retrotech, retro gaming, Nintendo, and historical computing technology",
+    "Local regional Victorian news (including Albury-Wodonga and border communities)"
+]
 
-TOPIC PRIORITY (score relevance against this hierarchy — higher tiers matter more):
-1. EU institutional politics and policy-making (Commission, Council, Parliament, 
-   Court of Justice, legislative process, enlargement)
-2. Transatlantic relations (EU-US trade, defense/NATO, tech regulation, sanctions 
-   coordination, diplomatic disputes)
-3. EU-China relations and de-risking (FDI screening, export controls, supply chains, 
-   critical minerals, tariffs)
-4. Political risk and geoeconomics more broadly (sanctions regimes, sovereign risk, 
-   regulatory shifts affecting investors/business)
-5. Francophone Africa politics and EU/France relations with the region (Sahel, 
-   France's Africa policy, EU development/security engagement)
+formatted_interests = "\n".join([f"- {topic}" for topic in USER_INTEREST_TOPICS])
 
-Articles with no meaningful connection to any of these five tiers should score low 
-regardless of writing quality — do not let a well-written piece on an unrelated 
-topic (e.g. pure domestic politics of a member state with no EU/transatlantic 
-angle, human interest, sports, entertainment, routine announcements) outscore a 
-relevant one.
+PROMPT_PERSONALIZED_CURATION = f"""You are an executive editor scoring daily news articles for a user with specific interest domains.
 
-RULES:
-1. Semantic Deduplication: Identify articles covering the exact same underlying 
-   event or story. From each group, keep ONLY the single best, most in-depth 
-   article. Discard the rest.
-2. Combined Scoring (1-100): Weight topic relevance (per the hierarchy above) 
-   FIRST, then quality within that. 
-   - FAVOR renowned, analytical sources (FT, Economist, major broadsheets).
-   - PRIORITIZE deep-dive, long-form journalism and significant policy/regulatory 
-     developments.
-   - HEAVILY PENALIZE short "live blog" updates, listicles, wire snippets, or 
-     generic opinion columns — even on-topic ones score low if superficial.
+Evaluate candidate articles by assigning a score from 1 to 100 and eliminating duplicate coverage.
 
-Return your evaluation as a raw JSON array of dictionaries with 'index' and 'score'. 
-No markdown, no backticks, no preamble.
+PRIMARY USER INTEREST TOPICS:
+{formatted_interests}
 
-Example:
-[
-  {"index": 0, "score": 95},
-  {"index": 3, "score": 88}
-]"""
-        elif topic == "ai_policy":
-            prompt = """You are a strict editor selecting ONE article on AI policy and regulation for a 
-briefing read by an MSc student in political risk, whose interest in AI is as a 
-regulatory/geopolitical variable — not general tech news.
+EVALUATION & SCORING RULES:
+1. Interest Alignment: Articles directly matching one or more of the PRIMARY USER INTEREST TOPICS must receive high scores (70–100).
+2. Off-Topic Filtering: Articles completely unrelated to any listed interest topic (e.g. international corporate news, unrelated sports like European soccer, foreign regional news) must receive low scores (below 30).
+3. Semantic Deduplication: If multiple articles cover the exact same story, retain ONLY the single most detailed, comprehensive piece and assign lower/zero scores to the duplicates.
+4. Depth Preference: Reward long-form reporting, interviews, and analytical pieces over short wire summaries or live-blog posts.
 
-Score candidates on:
-- Relevance to AI governance, regulation, or geopolitics: EU AI Act implementation, 
-  US-China AI/chip competition, export controls on semiconductors, frontier model 
-  governance, national AI strategy, antitrust/competition action against AI firms.
-- Depth and quality: FAVOR long-form policy analysis over wire snippets or product 
-  announcements. A product launch or model release with no regulatory/policy angle 
-  scores low here even if AI-related — that belongs in general AI industry news, 
-  which this briefing does not include today.
-- Deduplicate: if multiple articles cover the same story, keep only the best one.
+Return your evaluation as a raw JSON array of dictionaries containing 'index' and 'score'. Do not include markdown formatting or extra text.
 
-Return a raw JSON array of dictionaries with 'index' and 'score'. No markdown, no 
-backticks, no preamble.
-
-Example:
-[
-  {"index": 0, "score": 95},
-  {"index": 3, "score": 88}
-]"""
-        else:
-            prompt = f"""You are a professional executive editor curating an industry briefing.
-Score candidates on importance and quality from 1 to 100, and eliminate duplicates.
-Return a raw JSON array of dictionaries with 'index' and 'score'. No markdown, no backticks, no preamble.
-Example:
+Example output format:
 [
   {{"index": 0, "score": 95}},
-  {{"index": 3, "score": 88}}
+  {{"index": 2, "score": 82}}
 ]"""
 
-        response = model.generate_content([prompt, articles_text])
-        response_text = response.text.strip()
-        if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-        response_text = response_text.strip()
+def gemini_score_articles(articles):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key or genai is None or not articles:
+        return articles
 
-        data = json.loads(response_text)
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash')
+
+        article_summaries = []
+        for idx, art in enumerate(articles):
+            article_summaries.append(f"[{idx}] Title: {art['title']}\nDescription: {art.get('description', '')}\n")
+
+        full_prompt = f"{PROMPT_PERSONALIZED_CURATION}\n\nCandidate Articles:\n" + "\n".join(article_summaries)
+        response = model.generate_content(full_prompt)
+        text_resp = response.text.strip()
         
-        scored = []
-        for i, art in enumerate(articles):
-            art_copy = art.copy()
-            art_copy['_score'] = -1
-            for item in data:
-                if item.get("index") == i:
-                    art_copy['_score'] = item.get("score", 0)
-                    break
-            scored.append(art_copy)
-            
-        scored.sort(key=lambda x: x.get('_score', 0), reverse=True)
-        return scored
+        if text_resp.startswith("```json"):
+            text_resp = text_resp[7:]
+        if text_resp.endswith("```"):
+            text_resp = text_resp[:-3]
+        text_resp = text_resp.strip()
+
+        scores_data = json.loads(text_resp)
+        score_map = {item["index"]: item["score"] for item in scores_data}
+
+        for idx, art in enumerate(articles):
+            art["score"] = score_map.get(idx, 0)
+
+        articles.sort(key=lambda x: x.get("score", 0), reverse=True)
     except Exception as e:
-        print(f"Error using Gemini API for selection on topic {topic}: {e}. Falling back to -1 scores.", file=sys.stderr)
-        scored = [art.copy() for art in articles]
-        for a in scored:
-            a['_score'] = -1
-        return scored
+        print(f"⚠️ Gemini scoring error, falling back to keyword logic: {e}", file=sys.stderr)
 
-PREMIER_PUBLISHERS = {
-    "ft", "lemonde", "politico", "economist", "reuters", "bloomberg", 
-    "wsj", "theverge", "arstechnica", "technologyreview", "euractiv", 
-    "foreignaffairs", "foreignpolicy", "lesechos", "lefigaro", "wired"
-}
+    return articles
 
-def extract_source_domain(article):
-    """Extract clean source publisher name/domain from Google News title or direct link."""
-    link = article.get('link', '')
-    title = article.get('title', '')
+# ==========================================
+# 3. BACKUP KEYWORD SCORING (FAILSAFE)
+# ==========================================
+
+def calculate_fallback_score(title, description):
+    text = f"{title} {description}".lower()
+    score = 50
     
-    source = "unknown"
-    # 1. Google News RSS titles format: "Headline text - Source Name"
-    if ' - ' in title:
-        source = title.rsplit(' - ', 1)[1].strip().lower()
-        if source.startswith("www."):
-            source = source[4:]
-    # 2. Direct feed URL domain fallback
-    elif link and "news.google.com" not in link:
-        domain = urllib.parse.urlparse(link).netloc.lower()
-        if domain.startswith("www."):
-            domain = domain[4:]
-        source = domain
-
-    # Normalize brand variants
-    if "politico" in source:
-        return "politico"
-    if "lemonde" in source or "le monde" in source:
-        return "lemonde"
-    if "ft.com" in source or "financial times" in source:
-        return "ft"
-    if "economist" in source:
-        return "economist"
-    if "theverge" in source or "the verge" in source:
-        return "theverge"
-    if "arstechnica" in source or "ars technica" in source:
-        return "arstechnica"
-    if "reuters" in source:
-        return "reuters"
-    if "bloomberg" in source:
-        return "bloomberg"
-    if "wsj" in source or "wall street journal" in source:
-        return "wsj"
-    if "euractiv" in source:
-        return "euractiv"
-    if "technologyreview" in source or "technology review" in source or "mit tech" in source:
-        return "technologyreview"
-
-    return source
-
-def score_articles(articles, profile="political_risk"):
-    """Scores articles based on topic-specific keyword matching and publisher prestige."""
-    import re
+    keywords = [
+        r'\bafl\b', r'\bessendon\b', r'\bvictoria\b', r'\bvictorian\b', 
+        r'\balbury\b', r'\bradio\b', r'\bcommunity radio\b', r'\bnintendo\b', 
+        r'\bretrotech\b', r'\bretro gaming\b', r'\baustralian politics\b',
+        r'\bcomedy\b', r'\bmedia\b', r'\bus politics\b'
+    ]
     
-    if profile == "political_risk":
-        weights = {
-            'eu_institutional': 10, 'transatlantic': 9, 'eu_china': 8,
-            'geoeconomics': 7, 'francophone_africa': 6, 'negative': -20
-        }
-        keywords = {
-            'eu_institutional': [
-                r'\beu\b', r'\beuropean union\b', r'\bcommission\b', r'\bparliament\b', 
-                r'\bcouncil\b', r'\bcourt of justice\b', r'\bcjeu\b', r'\blegislation\b', 
-                r'\benlargement\b', r'\bbrussels\b', r'\bvon der leyen\b', r'\bmetsola\b'
-            ],
-            'transatlantic': [
-                r'\bus\b', r'\bunited states\b', r'\btransatlantic\b', r'\bnato\b', 
-                r'\bwashington\b', r'\bbiden\b', r'\btrump\b', r'\btrade dispute\b', 
-                r'\bira\b', r'\binflation reduction act\b', r'\bdefense\b'
-            ],
-            'eu_china': [
-                r'\bchina\b', r'\bbeijing\b', r'\bde-risking\b', r'\bfdi screening\b', 
-                r'\bexport controls\b', r'\bsupply chains\b', r'\bcritical minerals\b', 
-                r'\btariffs\b', r'\bevs\b', r'\belectric vehicles\b'
-            ],
-            'geoeconomics': [
-                r'\bsanctions\b', r'\bsovereign risk\b', r'\bregulatory\b', r'\bgeoeconomic\b',
-                r'\binvestment\b', r'\btrade war\b', r'\bgeopolitics\b', r'\bmercosur\b'
-            ],
-            'francophone_africa': [
-                r'\bafrica\b', r'\bsahel\b', r'\bmali\b', r'\bniger\b', r'\bburkina faso\b',
-                r'\bsenegal\b', r'\bcote d\'ivoire\b', r'\bivory coast\b', r'\bfrance\b',
-                r'\bmacron\b', r'\bparis\b', r'\bfrancophone\b', r'\becowas\b'
-            ],
-            'negative': [
-                r'\bsports\b', r'\bfootball\b', r'\bcelebrity\b', r'\bentertainment\b',
-                r'\bmurder\b', r'\baccident\b', r'\bgossip\b', r'\breal madrid\b', r'\bfifa\b'
-            ]
-        }
-    elif profile == "ai_policy":
-        weights = {'ai_policy': 10, 'chip_geo': 8, 'negative': -20}
-        keywords = {
-            'ai_policy': [
-                r'\bai act\b', r'\bai regulation\b', r'\bai policy\b', r'\bexport controls\b', 
-                r'\bgovernance\b', r'\bchips act\b', r'\bexecutive order\b', r'\bcompliance\b', 
-                r'\bftc\b', r'\bdoj\b'
-            ],
-            'chip_geo': [
-                r'\bnvidia\b', r'\btsmc\b', r'\basml\b', r'\bsemiconductor\b', 
-                r'\badvanced chips\b', r'\bgpu\b', r'\bnational security\b'
-            ],
-            'negative': [
-                r'\bsports\b', r'\bcelebrity\b', r'\bcrypto\b', r'\bnft\b', r'\bgossip\b'
-            ]
-        }
-    elif profile == "ai_industry":
-        weights = {'models_tech': 10, 'industry_compute': 7, 'negative': -20}
-        keywords = {
-            'models_tech': [
-                r'\bopenai\b', r'\banthropic\b', r'\bgemini\b', r'\bchatgpt\b', 
-                r'\bclaude\b', r'\bllm\b', r'\bdeepmind\b', r'\bmistral\b', 
-                r'\bllama\b', r'\bmodel release\b', r'\breasoning model\b'
-            ],
-            'industry_compute': [
-                r'\bstartup\b', r'\bfunding\b', r'\bdatacenter\b', r'\bcompute\b', 
-                r'\bsupercomputer\b', r'\bapple intelligence\b'
-            ],
-            'negative': [
-                r'\bsports\b', r'\bcrypto\b', r'\bnft\b', r'\bscam\b', r'\bgossip\b'
-            ]
-        }
+    for kw in keywords:
+        if re.search(kw, text):
+            score += 15
 
-    compiled = {cat: [re.compile(kw, re.IGNORECASE) for kw in kws] for cat, kws in keywords.items()}
-    scored = []
+    negative_keywords = [r'\bsoccer\b', r'\bcricket\b', r'\bcelebrity gossip\b']
+    for nkw in negative_keywords:
+        if re.search(nkw, text):
+            score -= 20
+
+    return max(0, min(100, score))
+
+# ==========================================
+# 4. DIVERSITY CAP & INSTAPAPER SYNC
+# ==========================================
+
+def apply_diversity_cap(articles, max_per_domain=2):
+    domain_counts = {}
+    capped_list = []
     
     for art in articles:
-        text = f"{art.get('title', '')} {art.get('description', '')}"
-        score = 0
-        for cat, regexes in compiled.items():
-            for r in regexes:
-                m = len(r.findall(text))
-                if m > 0:
-                    score += m * weights[cat]
-                    if r.search(art.get('title', '')):
-                        score += weights[cat]
-                        
-        domain = extract_source_domain(art)
-        # Heavy quality boost for premier publications
-        if domain in PREMIER_PUBLISHERS:
-            score += 35
-        else:
-            # Deprioritize unknown regional micro-blogs
-            score -= 20
+        domain = urllib.parse.urlparse(art['link']).netloc
+        count = domain_counts.get(domain, 0)
+        if count < max_per_domain:
+            capped_list.append(art)
+            domain_counts[domain] = count + 1
             
-        art_copy = art.copy()
-        art_copy['_score'] = score
-        scored.append(art_copy)
-        
-    scored.sort(key=lambda x: x.get('_score', 0), reverse=True)
-    return scored
+    return capped_list
 
-def select_with_diversity(scored_articles, count, max_per_source=2, pool_name="political_risk", global_sources=None):
-    """
-    Selects `count` articles from `scored_articles`, capping articles per source domain
-    and favoring unrepresented publishers for similarly-scored articles.
-    """
-    if global_sources is None:
-        global_sources = {}
-        
-    selected = []
-    pool_sources = {}
-    candidates = list(scored_articles)
+def post_to_instapaper(url, title="", summary=""):
+    username = os.getenv("INSTAPAPER_USERNAME")
+    password = os.getenv("INSTAPAPER_PASSWORD")
     
-    while len(selected) < count and candidates:
-        # Find candidates whose source has not hit the per-pool cap
-        valid_candidates = [
-            art for art in candidates 
-            if pool_sources.get(extract_source_domain(art), 0) < max_per_source
-        ]
-        
-        if not valid_candidates:
-            # Relax cap if strictly enforcing it would leave slots empty
-            needed = count - len(selected)
-            print(f"Notice: Relaxed source cap of {max_per_source} for '{pool_name}' pool. Adding {needed} remaining top article(s).")
-            for art in candidates[:needed]:
-                selected.append(art)
-                domain = extract_source_domain(art)
-                global_sources[domain] = global_sources.get(domain, 0) + 1
-            break
-            
-        # Get highest score among valid candidates
-        max_score = max(art.get('_score', 0) for art in valid_candidates)
-        top_candidates = [art for art in valid_candidates if art.get('_score', 0) == max_score]
-        
-        # Favor a candidate from a source not yet represented in today's global picks
-        chosen = None
-        for art in top_candidates:
-            domain = extract_source_domain(art)
-            if global_sources.get(domain, 0) == 0:
-                chosen = art
-                break
-                
-        if not chosen:
-            chosen = top_candidates[0]
-            
-        selected.append(chosen)
-        candidates.remove(chosen)
-        
-        domain = extract_source_domain(chosen)
-        pool_sources[domain] = pool_sources.get(domain, 0) + 1
-        global_sources[domain] = global_sources.get(domain, 0) + 1
-        
-    return selected
+    if not username or not password:
+        print("Instapaper credentials missing. Skipping post.", file=sys.stderr)
+        return False
 
-def select_articles_by_keyword_scoring(articles, top_n=5):
-    """Legacy compatibility function for political risk selection."""
-    scored = score_articles(articles, profile="political_risk")
-    return select_with_diversity(scored, count=top_n, max_per_source=2, pool_name="Political Risk")
-
-def curate_all_articles(pol_articles, ai_policy_articles, ai_industry_articles, use_gemini=False, gemini_key=None):
-    """
-    Curates 8 total articles:
-    - 7 Political Risk / EU / Transatlantic (max 2 per domain)
-    - 1 AI Policy / Regulation (max 2 per domain, with fallback to AI Industry)
-    """
-    global_sources = {}
-    
-    # 1. Political Risk Pool (7 articles)
-    if use_gemini and gemini_key:
-        scored_pol = gemini_score_articles(pol_articles, "political_risk", gemini_key)
-    else:
-        scored_pol = score_articles(pol_articles, profile="political_risk")
-    selected_pol = select_with_diversity(scored_pol, count=7, max_per_source=2, pool_name="Political Risk", global_sources=global_sources)
-    
-    # 2. AI Policy Pool (1 article)
-    seen_urls = {a['link'] for a in selected_pol}
-    filt_ai_pol = [a for a in ai_policy_articles if a['link'] not in seen_urls]
-    if use_gemini and gemini_key:
-        scored_ai_pol = gemini_score_articles(filt_ai_pol, "ai_policy", gemini_key)
-    else:
-        scored_ai_pol = score_articles(filt_ai_pol, profile="ai_policy")
-        
-    # We want a high-quality AI Policy article (score >= 60). If none, we fall back.
-    high_quality_ai_pol = [a for a in scored_ai_pol if a.get('_score', 0) >= 60]
-    
-    selected_ai_pol = select_with_diversity(high_quality_ai_pol, count=1, max_per_source=2, pool_name="AI Policy", global_sources=global_sources)
-    
-    if not selected_ai_pol:
-        print("No AI Policy article cleared the quality bar (score >= 60) or none available. Falling back to AI Industry.")
-        seen_urls.update({a['link'] for a in selected_pol})
-        filt_ai_ind = [a for a in ai_industry_articles if a['link'] not in seen_urls]
-        if use_gemini and gemini_key:
-            scored_ai_ind = gemini_score_articles(filt_ai_ind, "ai_industry", gemini_key)
-        else:
-            scored_ai_ind = score_articles(filt_ai_ind, profile="ai_industry")
-        selected_fallback = select_with_diversity(scored_ai_ind, count=1, max_per_source=2, pool_name="AI Industry", global_sources=global_sources)
-        return selected_pol + selected_fallback
-        
-    return selected_pol + selected_ai_pol
-
-_oauth_session_cache = None
-
-def get_instapaper_oauth_session(consumer_key, consumer_secret, username, password):
-    """Obtains and caches an OAuth 1.0 session for the Instapaper Full API."""
-    global _oauth_session_cache
-    if _oauth_session_cache is not None:
-        return _oauth_session_cache
-        
-    try:
-        import requests
-        from requests_oauthlib import OAuth1
-        auth = OAuth1(consumer_key, consumer_secret)
-        token_url = "https://www.instapaper.com/api/1.1/oauth/access_token"
-        data = {
-            'x_auth_username': username,
-            'x_auth_password': password,
-            'x_auth_mode': 'client_auth'
-        }
-        resp = requests.post(token_url, auth=auth, data=data, timeout=10)
-        if resp.status_code == 200:
-            params = dict(urllib.parse.parse_qsl(resp.text))
-            oauth_token = params.get('oauth_token')
-            oauth_token_secret = params.get('oauth_token_secret')
-            if oauth_token and oauth_token_secret:
-                _oauth_session_cache = OAuth1(consumer_key, consumer_secret, oauth_token, oauth_token_secret)
-                return _oauth_session_cache
-        else:
-            print(f"Warning: Instapaper OAuth authentication failed: {resp.status_code} {resp.text}", file=sys.stderr)
-    except Exception as e:
-        print(f"Warning: Instapaper OAuth initialization failed: {e}", file=sys.stderr)
-    return None
-
-def sync_to_instapaper(username, password, url, title=None, raw_content=None):
-    """
-    Add a URL or raw article content to Instapaper.
-    Uses Instapaper Full OAuth API if raw_content or OAuth credentials are present,
-    otherwise falls back to the Simple API.
-    """
-    consumer_key = os.environ.get("INSTAPAPER_KEY")
-    consumer_secret = os.environ.get("INSTAPAPER_SECRET")
-    
-    # 1. Try Full API with raw HTML content (Bypasses server paywall fetching)
-    if consumer_key and consumer_secret and raw_content:
-        oauth_auth = get_instapaper_oauth_session(consumer_key, consumer_secret, username, password)
-        if oauth_auth:
-            try:
-                import requests
-                add_url = "https://www.instapaper.com/api/1.1/bookmarks/add"
-                payload = {
-                    'url': url,
-                    'content': raw_content
-                }
-                if title:
-                    payload['title'] = title
-                res = requests.post(add_url, auth=oauth_auth, data=payload, timeout=15)
-                if res.status_code == 200:
-                    print(f"Successfully synced [Full-Text OAuth]: {title or url}")
-                    return True
-                else:
-                    print(f"OAuth bookmark add failed ({res.status_code}): {res.text}. Falling back to Simple API...", file=sys.stderr)
-            except Exception as e:
-                print(f"OAuth bookmark add error ({e}). Falling back to Simple API...", file=sys.stderr)
-
-    # 2. Simple API fallback
-    data = {
-        'username': username,
-        'password': password,
-        'url': url
-    }
+    payload = {'username': username, 'password': password, 'url': url}
     if title:
-        data['title'] = title
-        
-    encoded_data = urllib.parse.urlencode(data).encode('utf-8')
-    req = urllib.request.Request(
-        INSTAPAPER_ADD_URL,
-        data=encoded_data,
-        headers={'User-Agent': 'Mozilla/5.0'}
-    )
-    
+        payload['title'] = title
+    if summary:
+        payload['selection'] = summary
+
     try:
-        context = ssl._create_unverified_context()
-        with urllib.request.urlopen(req, context=context) as response:
-            status = response.getcode()
-            if status == 201:
-                print(f"Successfully synced: {url}")
-                return True
-            else:
-                print(f"Failed to sync {url}. Status code: {status}", file=sys.stderr)
-                return False
-    except urllib.error.HTTPError as e:
-        if e.code == 403:
-            print("Authentication failed: Check your Instapaper username and password.", file=sys.stderr)
-        else:
-            print(f"HTTP Error {e.code}: {e.read().decode('utf-8', errors='ignore')}", file=sys.stderr)
-        return False
+        data = urllib.parse.urlencode(payload).encode('utf-8')
+        req = urllib.request.Request(INSTAPAPER_ADD_URL, data=data)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 201 or resp.status == 200
     except Exception as e:
-        print(f"Error syncing {url}: {e}", file=sys.stderr)
+        print(f"Error syncing to Instapaper: {e}", file=sys.stderr)
         return False
+
+# ==========================================
+# 5. MAIN EXECUTION PIPELINE
+# ==========================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Fetch top EU/policy news and sync them to Instapaper.")
-    parser.add_argument('--auto', action='store_true', help="Fetch feeds, auto-select articles using Gemini, and sync.")
-    parser.add_argument('--list', action='store_true', help="Fetch feeds and print articles in JSON format.")
-    parser.add_argument('--urls', nargs='+', help="Directly sync these URLs to Instapaper (Agent Mode).")
-    
+    parser = argparse.ArgumentParser(description="Sync curated news feeds to Instapaper.")
+    parser.add_argument("--dry-run", action="store_true", help="Run scoring without sending to Instapaper")
     args = parser.parse_args()
+
+    print("🚀 Fetching Australian news & personal interest feeds...")
+    all_raw_articles = []
     
-    username = os.environ.get("INSTAPAPER_USERNAME")
-    password = os.environ.get("INSTAPAPER_PASSWORD")
+    for feed_list in [FEEDS_POLITICAL_RISK, FEEDS_AI_POLICY, FEEDS_AI_INDUSTRY]:
+        for url in feed_list:
+            all_raw_articles.extend(fetch_rss_items(url))
+
+    print(f"📥 Fetched {len(all_raw_articles)} total candidate items from last 24h.")
+
+    if not all_raw_articles:
+        print("No recent articles found.")
+        return
+
+    # Score via Gemini
+    scored_articles = gemini_score_articles(all_raw_articles)
+
+    # Fallback score if Gemini omitted
+    for art in scored_articles:
+        if "score" not in art:
+            art["score"] = calculate_fallback_score(art["title"], art.get("description", ""))
+
+    # Sort and filter top candidates
+    scored_articles.sort(key=lambda x: x.get("score", 0), reverse=True)
+    filtered_articles = [a for a in scored_articles if a.get("score", 0) >= 60]
     
-    if not args.list and (not username or not password):
-        print("Error: INSTAPAPER_USERNAME and INSTAPAPER_PASSWORD must be set in environment or .env file.", file=sys.stderr)
-        sys.exit(1)
-        
-    if args.list:
-        pol_feeds = [
-            "https://www.politico.eu/section/policy/feed/",
-            "https://www.economist.com/the-world-this-week/rss.xml",
-            "https://www.economist.com/europe/rss.xml",
-            "https://www.economist.com/finance-and-economics/rss.xml",
-            "https://news.google.com/rss/search?q=site:lemonde.fr+international+OR+politique+OR+Europe&hl=fr&gl=FR&ceid=FR:fr",
-            "https://news.google.com/rss/search?q=site:euractiv.com+AND+(EU+OR+policy+OR+commission+OR+parliament)&hl=en-US&gl=US&ceid=US:en"
-        ]
-        all_articles = []
-        for feed in pol_feeds:
-            all_articles.extend(fetch_rss_items(feed))
-            
-        seen_titles = set()
-        deduped = []
-        for art in all_articles:
-            title_norm = art['title'].lower().strip()
-            if title_norm not in seen_titles:
-                seen_titles.add(title_norm)
-                deduped.append(art)
-                
-        print(json.dumps(deduped[:45], indent=2))
-        sys.exit(0)
-        
-    elif args.urls:
-        print(f"Agent Mode: Syncing {len(args.urls)} provided URLs to Instapaper...")
-        success_count = 0
-        for url in args.urls:
-            resolved_url = resolve_google_news_url(url)
-            raw_content = None
-            title = None
-            if "lemonde.fr" in resolved_url:
-                lm_data = fetch_lemonde_full_content(resolved_url)
-                if lm_data:
-                    raw_content = lm_data['html']
-                    title = lm_data['title']
-                    print(f"  [Le Monde Extracted] Full article retrieved ({len(raw_content)} bytes)")
-            elif "economist.com" in resolved_url:
-                ec_data = fetch_economist_full_content(resolved_url)
-                if ec_data:
-                    raw_content = ec_data['html']
-                    title = ec_data['title']
-                    print(f"  [Economist Extracted] Full article retrieved ({len(raw_content)} bytes)")
-            elif "ft.com" in resolved_url:
-                ft_data = fetch_ft_full_content(resolved_url)
-                if ft_data:
-                    raw_content = ft_data['html']
-                    title = ft_data['title']
-                    print(f"  [FT Extracted] Full article retrieved ({len(raw_content)} bytes)")
-            
-            final_url = get_unlocked_archive_url(resolved_url) if not raw_content else resolved_url
-            if sync_to_instapaper(username, password, final_url, title=title, raw_content=raw_content):
-                success_count += 1
-        print(f"Synced {success_count}/{len(args.urls)} articles to Instapaper.")
-        
-    elif args.auto:
-        print("Fetching RSS feeds across categories...")
-        pol_feeds = [
-            "https://www.politico.eu/section/policy/feed/",
-            "https://www.economist.com/the-world-this-week/rss.xml",
-            "https://www.economist.com/europe/rss.xml",
-            "https://www.economist.com/finance-and-economics/rss.xml",
-            "https://news.google.com/rss/search?q=site:lemonde.fr+international+OR+politique+OR+Europe&hl=fr&gl=FR&ceid=FR:fr",
-            "https://news.google.com/rss/search?q=site:euractiv.com+AND+(EU+OR+policy+OR+commission+OR+parliament)&hl=en-US&gl=US&ceid=US:en"
-        ]
-        ai_policy_feeds = [
-            "https://news.google.com/rss/search?q=site:politico.eu+%22AI+Act%22+OR+%22AI+regulation%22+OR+%22chips%22&hl=en-US&gl=US&ceid=US:en",
-            "https://news.google.com/rss/search?q=site:lemonde.fr+%22intelligence+artificielle%22+OR+IA&hl=fr&gl=FR&ceid=FR:fr",
-            "https://news.google.com/rss/search?q=site:euractiv.com+%22artificial+intelligence%22+OR+%22AI+Act%22&hl=en-US&gl=US&ceid=US:en"
-        ]
-        ai_industry_feeds = [
-            "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
-            "https://arstechnica.com/tag/ai/feed/",
-            "https://www.economist.com/science-and-technology/rss.xml",
-            "https://news.google.com/rss/search?q=site:arstechnica.com+OR+site:theverge.com+AND+(OpenAI+OR+Anthropic+OR+Mistral)&hl=en-US&gl=US&ceid=US:en"
-        ]
-        
-        pol_raw, ai_pol_raw, ai_ind_raw = [], [], []
-        for feed in pol_feeds:
-            pol_raw.extend(fetch_rss_items(feed))
-        for feed in ai_policy_feeds:
-            ai_pol_raw.extend(fetch_rss_items(feed))
-        for feed in ai_industry_feeds:
-            ai_ind_raw.extend(fetch_rss_items(feed))
-            
-        print(f"Fetched {len(pol_raw)} Political, {len(ai_pol_raw)} AI Policy, and {len(ai_ind_raw)} AI Industry articles.")
-        
-        def dedup(articles):
-            seen = set()
-            out = []
-            for art in articles:
-                tn = art['title'].lower().strip()
-                if tn not in seen:
-                    seen.add(tn)
-                    out.append(art)
-            return out
-            
-        pol_deduped = dedup(pol_raw)
-        ai_pol_deduped = dedup(ai_pol_raw)
-        ai_ind_deduped = dedup(ai_ind_raw)
-        
-        gemini_key = os.environ.get("GEMINI_API_KEY")
-        if gemini_key and gemini_key.strip() != "" and "your_gemini_api_key" not in gemini_key:
-            print("Selecting articles using Gemini API with topic scoring & source diversity...")
-            selected = curate_all_articles(pol_deduped, ai_pol_deduped, ai_ind_deduped, use_gemini=True, gemini_key=gemini_key)
-        else:
-            print("Selecting 8 articles with keyword scoring & source diversity...")
-            selected = curate_all_articles(pol_deduped, ai_pol_deduped, ai_ind_deduped, use_gemini=False)
-            
-        print("Resolving and syncing selected articles with full-text verification...")
-        success_count = 0
-        for art in selected:
-            title = art.get('title')
-            url = art.get('link')
-            resolved_url = resolve_google_news_url(url)
-            
-            raw_content = None
-            if "lemonde.fr" in resolved_url:
-                lm_data = fetch_lemonde_full_content(resolved_url)
-                if lm_data:
-                    raw_content = lm_data['html']
-                    if not title:
-                        title = lm_data['title']
-                    print(f"  [Le Monde Extracted] Full subscriber article retrieved ({len(raw_content)} bytes)")
-            elif "economist.com" in resolved_url:
-                ec_data = fetch_economist_full_content(resolved_url)
-                if ec_data:
-                    raw_content = ec_data['html']
-                    if not title:
-                        title = ec_data['title']
-                    print(f"  [Economist Extracted] Full article retrieved ({len(raw_content)} bytes)")
-                else:
-                    arch_url = get_unlocked_archive_url(resolved_url)
-                    if arch_url != resolved_url:
-                        resolved_url = arch_url
-                        print(f"  [Economist Archive Mirror] {resolved_url}")
-            elif "ft.com" in resolved_url:
-                ft_data = fetch_ft_full_content(resolved_url)
-                if ft_data:
-                    raw_content = ft_data['html']
-                    if not title:
-                        title = ft_data['title']
-                    print(f"  [FT Extracted] Full article retrieved ({len(raw_content)} bytes)")
-                else:
-                    # Check archive snapshot
-                    arch_url = get_unlocked_archive_url(resolved_url)
-                    if arch_url != resolved_url:
-                        resolved_url = arch_url
-                        print(f"  [FT Archive Mirror] {resolved_url}")
-                    else:
-                        print(f"  [FT Skipped] No subscriber session or archive mirror for {title}. Skipping paywall stub.", file=sys.stderr)
-                        continue
-            
-            final_url = get_unlocked_archive_url(resolved_url) if not raw_content else resolved_url
-            print(f"- Adding: {title or resolved_url} ({final_url})")
-            if sync_to_instapaper(username, password, final_url, title=title, raw_content=raw_content):
-                success_count += 1
-                
-        print(f"Successfully curated and synced {success_count} articles to Instapaper.")
-        
-    else:
-        parser.print_help()
+    # Enforce domain diversity cap
+    final_selection = apply_diversity_cap(filtered_articles, max_per_domain=2)[:10]
+
+    print(f"\n🎯 Selected {len(final_selection)} top curated articles:")
+    for idx, art in enumerate(final_selection, 1):
+        print(f"{idx}. [{art.get('score', 0)} pts] {art['title']} ({art['link']})")
+
+    if args.dry-run:
+        print("\n🧪 Dry run complete. No articles sent to Instapaper.")
+        return
+
+    print("\n📤 Syncing selected articles to Instapaper...")
+    success_count = 0
+    for art in final_selection:
+        if post_to_instapaper(art['link'], title=art['title'], summary=art.get('description', '')):
+            success_count += 1
+
+    print(f"✅ Successfully synced {success_count}/{len(final_selection)} articles to Instapaper!")
 
 if __name__ == "__main__":
     main()
