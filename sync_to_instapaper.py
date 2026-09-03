@@ -53,7 +53,7 @@ FEEDS_AI_INDUSTRY = [
     "https://www.foxsports.com.au/content-hosts/afl/rss",
     "https://www.theage.com.au/rss/culture.xml",
     "https://checkpointgaming.net/news/feed",
-    "https://news.google.com/rss/search?q=%22Australian+radio%22+OR+%22community+radio%22+OR+%22Essendon%22+OR+%22Albury%22&hl=en-AU&gl=AU&ceid=AU:en"
+    "https://news.google.com/rss/search?q=%22Australian+radio%22+OR+%22community+radio%22+OR+%22Essendon%22+OR+%22Albury%22+OR+%22Australian+Cricket%22&hl=en-AU&gl=AU&ceid=AU:en"
 ]
 
 def is_within_24_hours(pub_date_str):
@@ -67,6 +67,42 @@ def is_within_24_hours(pub_date_str):
         return (now - dt).total_seconds() <= 24 * 3600
     except Exception:
         return True
+
+def check_paywall(url):
+    """
+    Checks if a URL belongs to a known paywalled publisher (like The Age or SMH)
+    and evaluates whether the content is locked behind a subscriber paywall.
+    """
+    if not any(domain in url for domain in ["theage.com.au", "smh.com.au", "theaustralian.com.au"]):
+        return False  # Non-paywalled domains (ABC, SBS, etc.) pass automatically
+
+    context = ssl._create_unverified_context()
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    req = urllib.request.Request(url, headers=headers)
+    
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=5) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+            
+            # Key paywall detection markers
+            paywall_indicators = [
+                '"isAccessibleForFree":false',
+                '"isAccessibleForFree": false',
+                'class="paywall"',
+                'id="paywall"',
+                'subscriber-only',
+                'subscribe-gate',
+                'subscriber-gate'
+            ]
+            
+            for indicator in paywall_indicators:
+                if indicator in html:
+                    return True
+                    
+    except Exception:
+        pass  # If request fails or times out, assume accessible to be safe
+        
+    return False
 
 def fetch_rss_items(url):
     context = ssl._create_unverified_context()
@@ -93,21 +129,45 @@ def fetch_rss_items(url):
                     desc_text = re.sub('<[^<]+?>', '', desc_text).strip()
 
                 if is_within_24_hours(pub_date_text):
+                    # Inspect for paywall status
+                    is_locked = check_paywall(link_text.strip())
+                    
                     items.append({
                         'title': title_text.strip(),
                         'link': link_text.strip(),
                         'description': desc_text,
-                        'pub_date': pub_date_text
+                        'pub_date': pub_date_text,
+                        'is_paywalled': is_locked
                     })
     except Exception as e:
         print(f"Error fetching feed {url}: {e}", file=sys.stderr)
     return items
 
 # ==========================================
-# 2. GEMINI SCORING & INTEREST PROMPTS
+# 2. GEMINI SCORING & DAY-AWARE PROMPTS
 # ==========================================
 
+current_day_num = datetime.datetime.now().weekday()
+day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+current_day_name = day_names[current_day_num]
+
+DAY_SPECIFIC_RULES = ""
+
+if current_day_num in [3, 4, 5, 6, 0]:  # Thursday through Monday
+    DAY_SPECIFIC_RULES += "- SPORTS PRIORITY: High priority for AFL and Australian Cricket (Aussie Men's/Women's national teams, BBL). Articles matching these topics can receive 70-100 scores.\n"
+else:  # Tuesday and Wednesday
+    DAY_SPECIFIC_RULES += "- SPORTS DE-PRIORITIZED: Low priority for sports. Unless it is massive breaking news, keep AFL and cricket article scores below 50.\n"
+
+if current_day_num == 5:  # Saturday
+    DAY_SPECIFIC_RULES += "- GAMING DAY: Allow maximum ONE high-quality retro gaming, retrotech, or video game article into the top selection.\n"
+else:
+    DAY_SPECIFIC_RULES += "- NO GAMING: Do not include video game, Nintendo, or retrotech articles today (assigned to Saturdays only). Cap gaming scores below 30.\n"
+
+if current_day_num == 6:  # Sunday
+    DAY_SPECIFIC_RULES += "- SUNDAY EDITION: Strongly favor long-form profiles, in-depth interviews, feature pieces, and lifestyle/culture coverage over short news wires.\n"
+
 USER_INTEREST_TOPICS = [
+    "Australian Cricket (Aussie Men's & Women's national teams, Ashes, World Cups, and Big Bash League)",
     "AFL (Australian Football League), Essendon Football Club, and Victorian sports news",
     "Australian Federal Politics, Victorian State Politics, and public policy in Victoria",
     "Australian Media, Commercial Radio, Community Radio, and broadcasting regulation",
@@ -119,18 +179,21 @@ USER_INTEREST_TOPICS = [
 
 formatted_interests = "\n".join([f"- {topic}" for topic in USER_INTEREST_TOPICS])
 
-PROMPT_PERSONALIZED_CURATION = f"""You are an executive editor scoring daily news articles for a user with specific interest domains.
+PROMPT_PERSONALIZED_CURATION = f"""You are an executive editor scoring daily news articles for a user's Kindle digest. Today is {current_day_name}.
 
 Evaluate candidate articles by assigning a score from 1 to 100 and eliminating duplicate coverage.
 
 PRIMARY USER INTEREST TOPICS:
 {formatted_interests}
 
+DAY-SPECIFIC RULES FOR TODAY ({current_day_name}):
+{DAY_SPECIFIC_RULES}
+
 EVALUATION & SCORING RULES:
-1. Interest Alignment: Articles directly matching one or more of the PRIMARY USER INTEREST TOPICS must receive high scores (70–100).
-2. Off-Topic Filtering: Articles completely unrelated to any listed interest topic (e.g. international corporate news, unrelated sports like European soccer, foreign regional news) must receive low scores (below 30).
-3. Semantic Deduplication: If multiple articles cover the exact same story, retain ONLY the single most detailed, comprehensive piece and assign lower/zero scores to the duplicates.
-4. Depth Preference: Reward long-form reporting, interviews, and analytical pieces over short wire summaries or live-blog posts.
+1. Interest Alignment: High priority for Victorian politics, federal news, and scheduled daily priorities (70-100).
+2. Off-Topic Filtering: Ignore foreign/unrelated cricket (e.g. IPL or non-Australian domestic series) and unrelated international sports (soccer, NFL) (score below 30).
+3. Semantic Deduplication: If multiple articles cover the exact same story, retain ONLY the single most detailed piece and score duplicates below 20.
+4. Depth Preference: Reward long-form reporting and analysis over short wire updates.
 
 Return your evaluation as a raw JSON array of dictionaries containing 'index' and 'score'. Do not include markdown formatting or extra text.
 
@@ -151,7 +214,8 @@ def gemini_score_articles(articles):
 
         article_summaries = []
         for idx, art in enumerate(articles):
-            article_summaries.append(f"[{idx}] Title: {art['title']}\nDescription: {art.get('description', '')}\n")
+            paywall_note = " [PAYWALLED]" if art.get("is_paywalled") else ""
+            article_summaries.append(f"[{idx}] Title: {art['title']}{paywall_note}\nDescription: {art.get('description', '')}\n")
 
         full_prompt = f"{PROMPT_PERSONALIZED_CURATION}\n\nCandidate Articles:\n" + "\n".join(article_summaries)
         response = model.generate_content(full_prompt)
@@ -167,7 +231,11 @@ def gemini_score_articles(articles):
         score_map = {item["index"]: item["score"] for item in scores_data}
 
         for idx, art in enumerate(articles):
-            art["score"] = score_map.get(idx, 0)
+            base_score = score_map.get(idx, 0)
+            # Penalize paywalled articles heavily so free equivalents are prioritized
+            if art.get("is_paywalled"):
+                base_score = max(0, base_score - 80)
+            art["score"] = base_score
 
         articles.sort(key=lambda x: x.get("score", 0), reverse=True)
     except Exception as e:
@@ -179,25 +247,28 @@ def gemini_score_articles(articles):
 # 3. BACKUP KEYWORD SCORING (FAILSAFE)
 # ==========================================
 
-def calculate_fallback_score(title, description):
+def calculate_fallback_score(title, description, is_paywalled=False):
     text = f"{title} {description}".lower()
     score = 50
     
     keywords = [
-        r'\bafl\b', r'\bessendon\b', r'\bvictoria\b', r'\bvictorian\b', 
-        r'\balbury\b', r'\bradio\b', r'\bcommunity radio\b', r'\bnintendo\b', 
-        r'\bretrotech\b', r'\bretro gaming\b', r'\baustralian politics\b',
-        r'\bcomedy\b', r'\bmedia\b', r'\bus politics\b'
+        r'\bafl\b', r'\bessendon\b', r'\bcricket\b', r'\baussie quicks\b', r'\bbbl\b',
+        r'\bvictoria\b', r'\bvictorian\b', r'\balbury\b', r'\bradio\b', 
+        r'\bcommunity radio\b', r'\bnintendo\b', r'\bretrotech\b', 
+        r'\baustralian politics\b', r'\bcomedy\b', r'\bmedia\b'
     ]
     
     for kw in keywords:
         if re.search(kw, text):
             score += 15
 
-    negative_keywords = [r'\bsoccer\b', r'\bcricket\b', r'\bcelebrity gossip\b']
+    negative_keywords = [r'\bsoccer\b', r'\bcelebrity gossip\b', r'\bipl\b']
     for nkw in negative_keywords:
         if re.search(nkw, text):
             score -= 20
+
+    if is_paywalled:
+        score -= 80
 
     return max(0, min(100, score))
 
@@ -251,7 +322,7 @@ def main():
     parser.add_argument("--auto", action="store_true", help="Run in automated mode via GitHub Actions")
     args, unknown = parser.parse_known_args()
 
-    print("🚀 Fetching Australian news & personal interest feeds...")
+    print(f"🚀 Fetching Australian news & personal interest feeds for {current_day_name}...")
     all_raw_articles = []
     
     for feed_list in [FEEDS_POLITICAL_RISK, FEEDS_AI_POLICY, FEEDS_AI_INDUSTRY]:
@@ -270,7 +341,7 @@ def main():
     # Fallback score if Gemini omitted
     for art in scored_articles:
         if "score" not in art:
-            art["score"] = calculate_fallback_score(art["title"], art.get("description", ""))
+            art["score"] = calculate_fallback_score(art["title"], art.get("description", ""), art.get("is_paywalled", False))
 
     # Sort and filter top candidates
     scored_articles.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -281,7 +352,8 @@ def main():
 
     print(f"\n🎯 Selected {len(final_selection)} top curated articles:")
     for idx, art in enumerate(final_selection, 1):
-        print(f"{idx}. [{art.get('score', 0)} pts] {art['title']} ({art['link']})")
+        pw_label = " 🔒 [PAYWALL SKIPPED]" if art.get('is_paywalled') else ""
+        print(f"{idx}. [{art.get('score', 0)} pts]{pw_label} {art['title']} ({art['link']})")
 
     if args.dry_run:
         print("\n🧪 Dry run complete. No articles sent to Instapaper.")
