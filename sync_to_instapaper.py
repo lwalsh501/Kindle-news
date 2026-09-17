@@ -69,12 +69,8 @@ def is_within_24_hours(pub_date_str):
         return True
 
 def check_paywall(url):
-    """
-    Checks if a URL belongs to a known paywalled publisher (like The Age or SMH)
-    and evaluates whether the content is locked behind a subscriber paywall.
-    """
     if not any(domain in url for domain in ["theage.com.au", "smh.com.au", "theaustralian.com.au"]):
-        return False  # Non-paywalled domains (ABC, SBS, etc.) pass automatically
+        return False
 
     context = ssl._create_unverified_context()
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -84,7 +80,6 @@ def check_paywall(url):
         with urllib.request.urlopen(req, context=context, timeout=5) as response:
             html = response.read().decode('utf-8', errors='ignore')
             
-            # Key paywall detection markers
             paywall_indicators = [
                 '"isAccessibleForFree":false',
                 '"isAccessibleForFree": false',
@@ -98,9 +93,8 @@ def check_paywall(url):
             for indicator in paywall_indicators:
                 if indicator in html:
                     return True
-                    
     except Exception:
-        pass  # If request fails or times out, assume accessible to be safe
+        pass
         
     return False
 
@@ -129,9 +123,7 @@ def fetch_rss_items(url):
                     desc_text = re.sub('<[^<]+?>', '', desc_text).strip()
 
                 if is_within_24_hours(pub_date_text):
-                    # Inspect for paywall status
                     is_locked = check_paywall(link_text.strip())
-                    
                     items.append({
                         'title': title_text.strip(),
                         'link': link_text.strip(),
@@ -202,6 +194,46 @@ Example output format:
   {{"index": 0, "score": 95}},
   {{"index": 2, "score": 82}}
 ]"""
+
+def gemini_score_articles(articles):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key or genai is None or not articles:
+        return articles
+
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash')
+
+        article_summaries = []
+        for idx, art in enumerate(articles):
+            paywall_note = " [PAYWALLED]" if art.get("is_paywalled") else ""
+            article_summaries.append(f"[{idx}] Title: {art['title']}{paywall_note}\nDescription: {art.get('description', '')}\n")
+
+        full_prompt = f"{PROMPT_PERSONALIZED_CURATION}\n\nCandidate Articles:\n" + "\n".join(article_summaries)
+        response = model.generate_content(full_prompt)
+        text_resp = response.text.strip()
+        
+        if text_resp.startswith("```json"):
+            text_resp = text_resp[7:]
+        if text_resp.endswith("```"):
+            text_resp = text_resp[:-3]
+        text_resp = text_resp.strip()
+
+        scores_data = json.loads(text_resp)
+        score_map = {item["index"]: item["score"] for item in scores_data}
+
+        for idx, art in enumerate(articles):
+            base_score = score_map.get(idx, 0)
+            if art.get("is_paywalled"):
+                base_score = max(0, base_score - 80)
+            art["score"] = base_score
+
+        articles.sort(key=lambda x: x.get("score", 0), reverse=True)
+    except Exception as e:
+        print(f"⚠️ Gemini scoring error, falling back to keyword logic: {e}", file=sys.stderr)
+
+    return articles
+
 # ==========================================
 # 3. BACKUP KEYWORD SCORING (FAILSAFE)
 # ==========================================
