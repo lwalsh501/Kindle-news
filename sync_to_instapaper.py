@@ -159,7 +159,7 @@ else:  # Tuesday and Wednesday
     DAY_SPECIFIC_RULES += "- SPORTS DE-PRIORITIZED: Low priority for sports. Unless it is massive breaking news, keep AFL and cricket article scores below 50.\n"
 
 if current_day_num == 5:  # Saturday
-    DAY_SPECIFIC_RULES += "- GAMING DAY: Allow maximum ONE high-quality retro gaming, retrotech, or video game article into the top selection.\n"
+    DAY_SPECIFIC_RULES += "- GAMING/RETROTECH FILTER: Include at most 1 gaming article per run, exclusively reserved for major breaking news (heavily favoring Nintendo). Omit entirely if there are no major headlines.\n"
 else:
     DAY_SPECIFIC_RULES += "- NO GAMING: Do not include video game, Nintendo, or retrotech articles today (assigned to Saturdays only). Cap gaming scores below 30.\n"
 
@@ -202,47 +202,6 @@ Example output format:
   {{"index": 0, "score": 95}},
   {{"index": 2, "score": 82}}
 ]"""
-
-def gemini_score_articles(articles):
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key or genai is None or not articles:
-        return articles
-
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
-
-        article_summaries = []
-        for idx, art in enumerate(articles):
-            paywall_note = " [PAYWALLED]" if art.get("is_paywalled") else ""
-            article_summaries.append(f"[{idx}] Title: {art['title']}{paywall_note}\nDescription: {art.get('description', '')}\n")
-
-        full_prompt = f"{PROMPT_PERSONALIZED_CURATION}\n\nCandidate Articles:\n" + "\n".join(article_summaries)
-        response = model.generate_content(full_prompt)
-        text_resp = response.text.strip()
-        
-        if text_resp.startswith("```json"):
-            text_resp = text_resp[7:]
-        if text_resp.endswith("```"):
-            text_resp = text_resp[:-3]
-        text_resp = text_resp.strip()
-
-        scores_data = json.loads(text_resp)
-        score_map = {item["index"]: item["score"] for item in scores_data}
-
-        for idx, art in enumerate(articles):
-            base_score = score_map.get(idx, 0)
-            # Penalize paywalled articles heavily so free equivalents are prioritized
-            if art.get("is_paywalled"):
-                base_score = max(0, base_score - 80)
-            art["score"] = base_score
-
-        articles.sort(key=lambda x: x.get("score", 0), reverse=True)
-    except Exception as e:
-        print(f"⚠️ Gemini scoring error, falling back to keyword logic: {e}", file=sys.stderr)
-
-    return articles
-
 # ==========================================
 # 3. BACKUP KEYWORD SCORING (FAILSAFE)
 # ==========================================
